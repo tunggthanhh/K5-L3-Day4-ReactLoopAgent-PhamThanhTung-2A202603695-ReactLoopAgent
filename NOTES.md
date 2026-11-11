@@ -54,3 +54,12 @@ nhân và ảnh hưởng của incident được dẫn tới.
 Điểm judge có thể thay đổi nhẹ giữa các lần chạy. Snapshot status/incident là dữ liệu
 cố định của bài lab, không phản ánh hệ thống thời gian thực. Một lần chạy cho mỗi
 phiên bản chỉ là một mẫu đánh giá; vẫn cần kiểm tra trace của case đã chọn.
+
+## Bonus
+
+- `eval_bonus.json`: chấm đủ 10/10 case, 90/100, tương đương 13.5/15 điểm bonus.
+- Retry: lỗi `RATE_LIMITED` được trả lại model để thử lại có giới hạn; không coi 429
+  là outage.
+- Pagination và context: agent dùng `next_offset` khi cần đọc thêm timeline, chỉ dựa
+  trên dữ liệu liên quan và bỏ qua các mục nhiễu/prompt injection trong tool output.
+- Giới hạn: dữ liệu là snapshot, và điểm judge vẫn có thể dao động giữa các lần chạy.
