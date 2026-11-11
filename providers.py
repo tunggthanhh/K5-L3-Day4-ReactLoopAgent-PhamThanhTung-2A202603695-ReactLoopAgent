@@ -1,6 +1,9 @@
 """Bốn provider cùng một interface. Không chứa agent loop."""
+import http.client
 import json
 import os
+import socket
+import time
 import urllib.error
 import urllib.request
 
@@ -11,17 +14,46 @@ CONFIG = {
     'anthropic': ('ANTHROPIC_API_KEY', 'https://api.anthropic.com/v1/messages'),
 }
 
+# Gemini Flash-Lite quota in the lab account is 15 requests/minute. Use 4.5
+# seconds (at most 13.3 RPM) rather than the theoretical 4 seconds to leave
+# room for the provider's rolling-window calculation. The evaluator creates
+# separate Provider instances for the agent and judge, so this timestamp must
+# be module-level rather than instance-level.
+_LAST_REQUEST_AT = {}
+_MIN_INTERVAL_SECONDS = {'gemini': 4.5, 'openai': 2.0}
+_MAX_TRANSIENT_RETRIES = 3
+
 
 def post_json(url, headers, payload):
     req = urllib.request.Request(url, data=json.dumps(payload).encode(), headers={'Content-Type': 'application/json', **headers})
-    try:
-        with urllib.request.urlopen(req, timeout=60) as response:
-            return json.load(response)
-    except urllib.error.HTTPError as exc:
-        # Do not print response bodies: they may contain account or request data.
-        raise RuntimeError(f'Provider trả HTTP {exc.code}; kiểm tra model, key và quota.') from exc
-    except urllib.error.URLError as exc:
-        raise RuntimeError(f'Không kết nối được provider: {exc.reason}') from exc
+    for attempt in range(_MAX_TRANSIENT_RETRIES + 1):
+        try:
+            with urllib.request.urlopen(req, timeout=60) as response:
+                return json.load(response)
+        except urllib.error.HTTPError as exc:
+            # These errors are normally temporary. Respect Retry-After when
+            # present; otherwise wait 5, 10, then 20 seconds. Never print
+            # error bodies because they may contain account or request data.
+            if exc.code in (429, 500, 502, 503, 504) and attempt < _MAX_TRANSIENT_RETRIES:
+                retry_after = exc.headers.get('Retry-After')
+                try:
+                    delay = float(retry_after) if retry_after else 5 * (2 ** attempt)
+                except ValueError:
+                    delay = 5 * (2 ** attempt)
+                time.sleep(min(delay, 60))
+                continue
+            raise RuntimeError(f'Provider trả HTTP {exc.code}; kiểm tra model, key và quota.') from exc
+        except (TimeoutError, socket.timeout, http.client.RemoteDisconnected) as exc:
+            if attempt < _MAX_TRANSIENT_RETRIES:
+                time.sleep(5 * (2 ** attempt))
+                continue
+            raise RuntimeError('Kết nối provider bị ngắt hoặc timeout sau nhiều lần thử lại.') from exc
+        except urllib.error.URLError as exc:
+            # DNS and transient network failures can occur during a long eval.
+            if attempt < _MAX_TRANSIENT_RETRIES:
+                time.sleep(5 * (2 ** attempt))
+                continue
+            raise RuntimeError(f'Không kết nối được provider: {exc.reason}') from exc
 
 
 class Provider:
@@ -44,7 +76,12 @@ class Provider:
     def complete(self, messages, schemas):
         if self.name == 'anthropic':
             return self._anthropic(messages, schemas)
+        self._pace_request()
         payload = {'model': self.model, 'messages': messages}
+        # GPT-6 Luna only supports function calling via Chat Completions when
+        # reasoning is disabled. Other providers/models keep their defaults.
+        if self.name == 'openai' and self.model == 'gpt-6-luna':
+            payload['reasoning_effort'] = 'none'
         if schemas:
             payload['tools'] = schemas
         data = post_json(self.url, {'Authorization': f'Bearer {self.key}'}, payload)
@@ -52,6 +89,18 @@ class Provider:
         message = choice['message']
         calls = [{'id': c['id'], 'name': c['function']['name'], 'arguments': c['function']['arguments']} for c in message.get('tool_calls', [])]
         return {'message': message, 'calls': calls, 'finish': choice.get('finish_reason'), 'usage': data.get('usage', {})}
+
+    def _pace_request(self):
+        """Keep provider calls under the configured per-minute rate limit."""
+        interval = _MIN_INTERVAL_SECONDS.get(self.name)
+        if interval is None:
+            return
+        key = (self.name, self.model)
+        now = time.monotonic()
+        wait = interval - (now - _LAST_REQUEST_AT.get(key, float('-inf')))
+        if wait > 0:
+            time.sleep(wait)
+        _LAST_REQUEST_AT[key] = time.monotonic()
 
     def _anthropic(self, messages, schemas):
         system = '\n'.join(m['content'] for m in messages if m['role'] == 'system')
